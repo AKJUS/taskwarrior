@@ -1,9 +1,10 @@
-name: backup
+name: Issue Backup
 
 on:
   schedule:
     # Mondays are backup days
-    - cron: '0 0 * * 1'
+    #- cron: '0 0 * * 1'
+    - cron: '30 * * * *'
 
 jobs:
   # This job runs `backup-github-repo` which captures all issues and pull requests,
@@ -31,7 +32,7 @@ jobs:
 
       - name: "Install backup-github-repo"
         # Uses the fork in https://github.com/maxlath/backup-github-repo/pull/13
-        run: npm install -g https://github.com/djmitche/backup-github-repo#no-html
+        run: npm install -g https://github.com/djmitche/backup-github-repo#exit-status
 
       - name: "Configure backup-github-repo"
         run: |
@@ -41,7 +42,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Run backup-github-repo"
-        run: backup-github-repo --no-html
+        run: |
+          backup-github-repo --no-html
 
       - name: "Remove unnecessary HTML"
         run: rm -rf repo-backup/html
