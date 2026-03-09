@@ -323,7 +323,7 @@ std::string ViewTask::render(std::vector<Task>& data, std::vector<int>& sequence
       if (cells[c].size() > max_lines) max_lines = cells[c].size();
 
       if (obfuscate)
-        if (_columns[c]->type() == "string")
+        if (_columns[c]->type() == "string" && _columns[c]->name() != "depends")
           for (auto& line : cells[c]) line = obfuscateText(line);
     }
 
