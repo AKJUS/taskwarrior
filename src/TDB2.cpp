@@ -38,11 +38,17 @@
 #include <util.h>
 
 #include <algorithm>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
 bool TDB2::debug_mode = false;
-static void dependency_scan(std::vector<Task>&);
+// This functions main job is to set Task::is_blocked / Task::is_blocking flags.
+static void dependency_scan(std::vector<Task>&, const std::unordered_map<std::string, size_t>&);
+
+// Build maps for dependency queries.
+static DependencyGraph build_dependency_graph(const std::vector<Task>&,
+                                              const std::unordered_map<std::string, size_t>&);
 
 ////////////////////////////////////////////////////////////////////////////////
 void TDB2::open_replica(const std::string& location, bool create_if_missing, bool read_write) {
@@ -60,7 +66,7 @@ void TDB2::add(Task& task) {
   rust::Vec<tc::Operation> ops;
   maybe_add_undo_point(ops);
 
-  auto uuid = task.get("uuid");
+  auto uuid = task.get_ref("uuid");
   changes[uuid] = task;
   tc::Uuid tcuuid = tc::uuid_from_string(uuid);
 
@@ -109,7 +115,7 @@ void TDB2::modify(Task& task) {
   // changes the user or hooks tried to apply to the "modified" attribute.
   task.setAsNow("modified");
   task.validate(false);
-  auto uuid = task.get("uuid");
+  auto uuid = task.get_ref("uuid");
 
   rust::Vec<tc::Operation> ops;
   maybe_add_undo_point(ops);
@@ -118,7 +124,7 @@ void TDB2::modify(Task& task) {
 
   // invoke the hook and allow it to modify the task before updating
   Task original;
-  get(uuid, original);
+  bool found_original = get(uuid, original);
   Context::getContext().hooks.onModify(original, task);
 
   tc::Uuid tcuuid = tc::uuid_from_string(uuid);
@@ -166,12 +172,40 @@ void TDB2::modify(Task& task) {
 
   replica()->commit_operations(std::move(ops));
 
-  invalidate_cached_info();
+  // If the task entered or left the pending set, we must invalidate the cache.
+  bool was_pending = found_original && (original.getStatus() == Task::pending);
+  bool now_pending = task.getStatus() == Task::pending;
+  if (was_pending != now_pending || !found_original) {
+    invalidate_cached_info();
+    return;
+  }
+
+  // If the task stayed in the set, we can edit the vector in-place.
+  // This speeds up modifications a lot relative to reloading and parsing from rust.
+  bool deps_changed = false;
+  if (_pending_tasks) {
+    auto* pt = find_pending(uuid);
+    if (pt) {
+      auto old_deps = pt->getDependencyUUIDs();
+      *pt = task;
+      auto new_deps = task.getDependencyUUIDs();
+      if (old_deps != new_deps) {
+        deps_changed = true;
+        dependency_scan(*_pending_tasks, pending_index());
+      }
+    }
+  }
+  // We have to drop the dependency map, in case modifications were made to those.
+  // We only drop it if they actually changed.
+  if (deps_changed) _dependency_graph = std::nullopt;
+  // We also have to drop _completed_tasks. This probably isn't strictly necessary
+  // but it seems sensible for correctness reasons.
+  _completed_tasks = std::nullopt;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 void TDB2::purge(Task& task) {
-  auto uuid = tc::uuid_from_string(task.get("uuid"));
+  auto uuid = tc::uuid_from_string(task.get_ref("uuid"));
   rust::Vec<tc::Operation> ops;
   auto maybe_tctask = replica()->get_task_data(uuid);
   if (maybe_tctask.is_some()) {
@@ -237,6 +271,7 @@ int TDB2::latest_id() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Not cached: callers read this once per process, and it can be very large.
 const std::vector<Task> TDB2::all_tasks() {
   Timer timer;
   auto all_tctasks = replica()->all_task_data();
@@ -246,40 +281,64 @@ const std::vector<Task> TDB2::all_tasks() {
     all.push_back(Task(std::move(tctask)));
   }
 
-  dependency_scan(all);
+  // Build a temporary map so that dependency_scan can resolve references
+  // inside all_tasks.
+  std::unordered_map<std::string, size_t> all_index;
+  all_index.reserve(all.size());
+  for (size_t i = 0; i < all.size(); ++i) all_index[all[i].get_ref("uuid")] = i;
+
+  dependency_scan(all, all_index);
 
   Context::getContext().time_load_us += timer.total_us();
   return all;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-const std::vector<Task> TDB2::pending_tasks() {
+// Load and cache pending tasks. The first call will build the UUID index,
+// after which it is reused.
+const std::vector<Task>& TDB2::pending_tasks() {
   if (!_pending_tasks) {
     Timer timer;
 
     auto pending_tctasks = replica()->pending_task_data();
     std::vector<Task> result;
+
+    result.reserve(pending_tctasks.size());
+
     for (auto& maybe_tctask : pending_tctasks) {
       auto tctask = maybe_tctask.take();
       result.push_back(Task(std::move(tctask)));
     }
 
-    dependency_scan(result);
+    // Build a UUID map for use with get()/modify() and dependency_scan()
+    // while the pending vector is already in memory.
+    _pending_index.emplace();
+    _pending_index->reserve(result.size());
+    for (size_t i = 0, n = result.size(); i < n; ++i)
+      _pending_index->emplace(result[i].get_ref("uuid"), i);
+
+    dependency_scan(result, *_pending_index);
 
     Context::getContext().time_load_us += timer.total_us();
-    _pending_tasks = result;
+    _pending_tasks = std::move(result);
   }
 
   return *_pending_tasks;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-const std::vector<Task> TDB2::completed_tasks() {
+// Load and cache all completed tests by scanning all tasks,
+// and excluding those in the working set. We cache it to speed up those reports
+// which involve completed tasks.
+const std::vector<Task>& TDB2::completed_tasks() {
   if (!_completed_tasks) {
     auto all_tctasks = replica()->all_task_data();
     auto& ws = working_set();
 
     std::vector<Task> result;
+
+    result.reserve(all_tctasks.size());
+
     for (auto& maybe_tctask : all_tctasks) {
       auto tctask = maybe_tctask.take();
       // if this task is _not_ in the working set, return it.
@@ -287,9 +346,44 @@ const std::vector<Task> TDB2::completed_tasks() {
         result.push_back(Task(std::move(tctask)));
       }
     }
-    _completed_tasks = result;
+    _completed_tasks = std::move(result);
   }
   return *_completed_tasks;
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Build and return the dependency map for pending tasks.
+// We invalidate it whenever pending_tasks may have changed.
+const DependencyGraph& TDB2::dependency_graph() {
+  if (!_dependency_graph) {
+    pending_tasks();
+    // reuse the UUID index
+    _dependency_graph = build_dependency_graph(*_pending_tasks, pending_index());
+  }
+
+  return *_dependency_graph;
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// This builds and returns the UUID map if it is missing.
+const std::unordered_map<std::string, size_t>& TDB2::pending_index() {
+  if (!_pending_index) {
+    _pending_index.emplace();
+    _pending_index->reserve(_pending_tasks->size());
+    for (size_t i = 0, n = _pending_tasks->size(); i < n; ++i)
+      _pending_index->emplace((*_pending_tasks)[i].get_ref("uuid"), i);
+  }
+
+  return *_pending_index;
+}
+
+// Finds the UUID in the index. Returns nullptr if the task is not in the pending
+// set.
+Task* TDB2::find_pending(const std::string& uuid) {
+  auto& idx = pending_index();
+  auto it = idx.find(uuid);
+  if (it != idx.end()) return &(*_pending_tasks)[it->second];
+  return nullptr;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -297,6 +391,8 @@ void TDB2::invalidate_cached_info() {
   _pending_tasks = std::nullopt;
   _completed_tasks = std::nullopt;
   _working_set = std::nullopt;
+  _dependency_graph = std::nullopt;
+  _pending_index = std::nullopt;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -306,14 +402,13 @@ bool TDB2::get(int id, Task& task) {
   const auto tcuuid = ws->by_index(id);
   if (!tcuuid.is_nil()) {
     std::string uuid = static_cast<std::string>(tcuuid.to_string());
-    // Load all pending tasks in order to get dependency data, and in particular
-    // `task.is_blocking` and `task.is_blocked`, set correctly.
-    std::vector<Task> pending = pending_tasks();
-    for (auto& pending_task : pending) {
-      if (pending_task.get("uuid") == uuid) {
-        task = pending_task;
-        return true;
-      }
+    // Load index of pending tasks.
+    pending_tasks();
+    // Lookup the UUID in the index instead of scanning the vector.
+    auto* pt = find_pending(uuid);
+    if (pt) {
+      task = *pt;
+      return true;
     }
   }
 
@@ -323,15 +418,22 @@ bool TDB2::get(int id, Task& task) {
 ////////////////////////////////////////////////////////////////////////////////
 // Locate task by UUID, including by partial ID, wherever it is.
 bool TDB2::get(const std::string& uuid, Task& task) {
-  // Load all pending tasks in order to get dependency data, and in particular
-  // `task.is_blocking` and `task.is_blocked`, set correctly.
-  std::vector<Task> pending = pending_tasks();
+  pending_tasks();
 
-  // try by raw uuid, if the length is right
-  for (auto& pending_task : pending) {
-    if (closeEnough(pending_task.get("uuid"), uuid, uuid.length())) {
-      task = pending_task;
-      return true;
+  // Try to match exact UUID within the index.
+  auto* pt = find_pending(uuid);
+  if (pt) {
+    task = *pt;
+    return true;
+  }
+
+  // try a partial match
+  if (uuid.length() < 36) {
+    for (const auto& pending_task : *_pending_tasks) {
+      if (closeEnough(pending_task.get_ref("uuid"), uuid, uuid.length())) {
+        task = pending_task;
+        return true;
+      }
     }
   }
 
@@ -358,15 +460,15 @@ bool TDB2::has(const std::string& uuid) {
 const std::vector<Task> TDB2::siblings(Task& task) {
   std::vector<Task> results;
   if (task.has("parent")) {
-    std::string parent = task.get("parent");
+    const auto& parent = task.get_ref("parent");
 
-    for (auto& i : this->pending_tasks()) {
+    for (const auto& i : pending_tasks()) {
       // Do not include self in results.
       if (i.id != task.id) {
         // Do not include completed or deleted tasks.
         if (i.getStatus() != Task::completed && i.getStatus() != Task::deleted) {
           // If task has the same parent, it is a sibling.
-          if (i.has("parent") && i.get("parent") == parent) {
+          if (i.has("parent") && i.get_ref("parent") == parent) {
             results.push_back(i);
           }
         }
@@ -378,39 +480,15 @@ const std::vector<Task> TDB2::siblings(Task& task) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Return the child tasks of a parent. Uses the _pending_tasks cache, to avoid
+// having to fetch this info from the Rust replica.
 const std::vector<Task> TDB2::children(Task& parent) {
-  // scan _pending_ tasks for those with `parent` equal to this task
   std::vector<Task> results;
-  std::string this_uuid = parent.get("uuid");
+  const auto& this_uuid = parent.get_ref("uuid");
 
-  auto& ws = working_set();
-  size_t end_idx = ws->largest_index();
-
-  for (size_t i = 0; i <= end_idx; i++) {
-    auto uuid = ws->by_index(i);
-    if (uuid.is_nil()) {
-      continue;
-    }
-
-    // skip self-references
-    if (uuid.to_string() == this_uuid) {
-      continue;
-    }
-
-    auto task_opt = replica()->get_task_data(uuid);
-    if (task_opt.is_none()) {
-      continue;
-    }
-    auto task = task_opt.take();
-
-    std::string parent_uuid;
-    if (!task->get("parent", parent_uuid)) {
-      continue;
-    }
-
-    if (parent_uuid == this_uuid) {
-      results.push_back(Task(std::move(task)));
-    }
+  for (const auto& i : pending_tasks()) {
+    if (i.get_ref("uuid") == this_uuid) continue;
+    if (i.has("parent") && i.get_ref("parent") == this_uuid) results.push_back(i);
   }
   return results;
 }
@@ -438,29 +516,58 @@ int TDB2::num_local_changes() { return (int)replica()->num_local_operations(); }
 int TDB2::num_reverts_possible() { return (int)replica()->num_undo_points(); }
 
 ////////////////////////////////////////////////////////////////////////////////
-// For any task that has depenencies, follow the chain of dependencies until the
-// end.  Along the way, update the Task::is_blocked and Task::is_blocking data
-// cache.
-static void dependency_scan(std::vector<Task>& tasks) {
-  for (auto& left : tasks) {
-    for (auto& dep : left.getDependencyUUIDs()) {
-      for (auto& right : tasks) {
-        if (right.get("uuid") == dep) {
-          // GC hasn't run yet, check both tasks for their current status
-          Task::status lstatus = left.getStatus();
-          Task::status rstatus = right.getStatus();
-          if (lstatus != Task::completed && lstatus != Task::deleted &&
-              rstatus != Task::completed && rstatus != Task::deleted) {
-            left.is_blocked = true;
-            right.is_blocking = true;
-          }
+// Set Task::is_blocked / Task::is_blocking flags using the pre-built UUID map
+static void dependency_scan(std::vector<Task>& tasks,
+                            const std::unordered_map<std::string, size_t>& uuid_index) {
+  // Reset all flags first. This is for safety reasons - if we don't do this
+  // dependency_scan() only sets them to true, so it can stay true (within the cache)
+  // even after we have changed a task's dependencies after a modify when
+  // dependency_scan() runs the second time - the flag will still be set to true!
+  // In many cases, this isn't user-visible - it's only visible in reports
+  // or filters that explicitly filter for +BLOCKING.
+  for (auto& task : tasks) {
+    task.is_blocking = false;
+    task.is_blocked = false;
+  }
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    auto lstatus = tasks[i].getStatus();
+    for (const auto& dep : tasks[i].getDependencyUUIDs()) {
+      auto it = uuid_index.find(dep);
+      if (it == uuid_index.end()) continue;
 
-          // Only want to break out of the "right" loop.
-          break;
-        }
+      size_t j = it->second;
+      auto rstatus = tasks[j].getStatus();
+      if (lstatus != Task::completed && lstatus != Task::deleted && rstatus != Task::completed &&
+          rstatus != Task::deleted) {
+        tasks[i].is_blocked = true;
+        tasks[j].is_blocking = true;
       }
     }
   }
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Build the full dependency map from the task vector.
+static DependencyGraph build_dependency_graph(
+    const std::vector<Task>& tasks, const std::unordered_map<std::string, size_t>& uuid_index) {
+  DependencyGraph graph;
+
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    const auto& deps = tasks[i].getDependencyUUIDs();
+    if (deps.empty()) continue;
+
+    const auto& uuid = tasks[i].get_ref("uuid");
+
+    for (const auto& dep : deps) {
+      auto it = uuid_index.find(dep);
+      if (it == uuid_index.end()) continue;
+
+      graph.dependencies[uuid].push_back(it->second);
+      graph.dependents[dep].push_back(i);
+    }
+  }
+
+  return graph;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
